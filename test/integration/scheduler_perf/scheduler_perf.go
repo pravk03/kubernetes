@@ -281,7 +281,7 @@ type testCase struct {
 	// be executed serially one after another.
 	WorkloadTemplate []op
 	// List of workloads to run under this testCase.
-	Workloads []*workload
+	Workloads []*Workload
 	// SchedulerConfigPath is the path of scheduler configuration
 	// Optional
 	SchedulerConfigPath string
@@ -307,7 +307,7 @@ func (tc *testCase) collectsMetrics() bool {
 	return false
 }
 
-func (tc *testCase) workloadNamesUnique() error {
+func (tc *testCase) WorkloadNamesUnique() error {
 	workloadUniqueNames := map[string]bool{}
 	for _, w := range tc.Workloads {
 		if workloadUniqueNames[w.Name] {
@@ -318,10 +318,10 @@ func (tc *testCase) workloadNamesUnique() error {
 	return nil
 }
 
-// workload is a subtest under a testCase that tests the scheduler performance
+// Workload is a subtest under a testCase that tests the scheduler performance
 // for a certain ordering of ops. The set of nodes created and pods scheduled
 // in a workload may be heterogeneous.
-type workload struct {
+type Workload struct {
 	// Name of the workload.
 	Name string
 	// Values of parameters used in the workloadTemplate.
@@ -351,7 +351,7 @@ type workload struct {
 	FeatureGates map[featuregate.Feature]bool
 }
 
-func (w *workload) isValid(mcc *metricsCollectorConfig) error {
+func (w *Workload) isValid(mcc *metricsCollectorConfig) error {
 	if w.Threshold.value < 0 {
 		return fmt.Errorf("invalid Threshold=%f; should be non-negative", w.Threshold.value)
 	}
@@ -364,7 +364,7 @@ func (w *workload) isValid(mcc *metricsCollectorConfig) error {
 	return w.ThresholdMetricSelector.isValid(mcc)
 }
 
-func (w *workload) setDefaults(testCaseThresholdMetricSelector *thresholdMetricSelector) {
+func (w *Workload) setDefaults(testCaseThresholdMetricSelector *thresholdMetricSelector) {
 	if w.ThresholdMetricSelector != nil {
 		return
 	}
@@ -476,8 +476,8 @@ func (p *params) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// get retrieves the parameter as an integer
-func (p params) get(key string) (int, error) {
+// Get retrieves the parameter as an integer
+func (p params) Get(key string) (int, error) {
 	// JSON unmarshal integer constants in an "any" field as float.
 	f, err := getParam[float64](p, key)
 	if err != nil {
@@ -504,7 +504,7 @@ func getParam[T float64 | string | bool](p params, key string) (T, error) {
 }
 
 // unusedParams returns the names of unusedParams
-func (w workload) unusedParams() []string {
+func (w Workload) unusedParams() []string {
 	var ret []string
 	for name := range w.Params.params {
 		if !w.Params.isUsed[name] {
@@ -574,12 +574,12 @@ type realOp interface {
 	// collectsMetrics checks if the op collects metrics.
 	collectsMetrics() bool
 	// patchParams returns a patched realOp of the same type after substituting
-	// parameterizable values with workload-specific values. One should implement
+	// parameterizable values with Workload-specific values. One should implement
 	// this method on the value receiver base type, not a pointer receiver base
 	// type, even though calls will be made from with a *realOp. This is because
 	// callers don't want the receiver to inadvertently modify the realOp
 	// (instead, it's returned as a return value).
-	patchParams(w *workload) (realOp, error)
+	patchParams(w *Workload) (realOp, error)
 }
 
 // runnableOp is an interface implemented by some operations. It makes it possible
@@ -636,10 +636,10 @@ func (*createNodesOp) collectsMetrics() bool {
 	return false
 }
 
-func (cno createNodesOp) patchParams(w *workload) (realOp, error) {
+func (cno createNodesOp) patchParams(w *Workload) (realOp, error) {
 	if cno.CountParam != "" {
 		var err error
-		cno.Count, err = w.Params.get(cno.CountParam[1:])
+		cno.Count, err = w.Params.Get(cno.CountParam[1:])
 		if err != nil {
 			return nil, err
 		}
@@ -674,10 +674,10 @@ func (*createNamespacesOp) collectsMetrics() bool {
 	return false
 }
 
-func (cmo createNamespacesOp) patchParams(w *workload) (realOp, error) {
+func (cmo createNamespacesOp) patchParams(w *Workload) (realOp, error) {
 	if cmo.CountParam != "" {
 		var err error
-		cmo.Count, err = w.Params.get(cmo.CountParam[1:])
+		cmo.Count, err = w.Params.Get(cmo.CountParam[1:])
 		if err != nil {
 			return nil, err
 		}
@@ -763,10 +763,10 @@ func (cpo *createPodsOp) collectsMetrics() bool {
 	return cpo.CollectMetrics
 }
 
-func (cpo createPodsOp) patchParams(w *workload) (realOp, error) {
+func (cpo createPodsOp) patchParams(w *Workload) (realOp, error) {
 	if cpo.CountParam != "" {
 		var err error
-		cpo.Count, err = w.Params.get(cpo.CountParam[1:])
+		cpo.Count, err = w.Params.Get(cpo.CountParam[1:])
 		if err != nil {
 			return nil, err
 		}
@@ -816,10 +816,10 @@ func (cpso *createPodSetsOp) collectsMetrics() bool {
 	return cpso.CreatePodsOp.CollectMetrics
 }
 
-func (cpso createPodSetsOp) patchParams(w *workload) (realOp, error) {
+func (cpso createPodSetsOp) patchParams(w *Workload) (realOp, error) {
 	if cpso.CountParam != "" {
 		var err error
-		cpso.Count, err = w.Params.get(cpso.CountParam[1:])
+		cpso.Count, err = w.Params.Get(cpso.CountParam[1:])
 		if err != nil {
 			return nil, err
 		}
@@ -863,7 +863,7 @@ func (dpo *deletePodsOp) collectsMetrics() bool {
 	return false
 }
 
-func (dpo deletePodsOp) patchParams(w *workload) (realOp, error) {
+func (dpo deletePodsOp) patchParams(w *Workload) (realOp, error) {
 	return &dpo, nil
 }
 
@@ -910,7 +910,7 @@ func (*churnOp) collectsMetrics() bool {
 	return false
 }
 
-func (co churnOp) patchParams(w *workload) (realOp, error) {
+func (co churnOp) patchParams(w *Workload) (realOp, error) {
 	return &co, nil
 }
 
@@ -951,7 +951,7 @@ func (*barrierOp) collectsMetrics() bool {
 	return false
 }
 
-func (bo barrierOp) patchParams(w *workload) (realOp, error) {
+func (bo barrierOp) patchParams(w *Workload) (realOp, error) {
 	if bo.StageRequirement == "" {
 		bo.StageRequirement = Scheduled
 	}
@@ -977,7 +977,7 @@ func (so *sleepOp) collectsMetrics() bool {
 	return false
 }
 
-func (so sleepOp) patchParams(w *workload) (realOp, error) {
+func (so sleepOp) patchParams(w *Workload) (realOp, error) {
 	if so.DurationParam != "" {
 		durationStr, err := getParam[string](w.Params, so.DurationParam[1:])
 		if err != nil {
@@ -1016,7 +1016,7 @@ func (*startCollectingMetricsOp) collectsMetrics() bool {
 	return false
 }
 
-func (scm startCollectingMetricsOp) patchParams(_ *workload) (realOp, error) {
+func (scm startCollectingMetricsOp) patchParams(_ *Workload) (realOp, error) {
 	return &scm, nil
 }
 
@@ -1036,7 +1036,7 @@ func (*stopCollectingMetricsOp) collectsMetrics() bool {
 	return true
 }
 
-func (scm stopCollectingMetricsOp) patchParams(_ *workload) (realOp, error) {
+func (scm stopCollectingMetricsOp) patchParams(_ *Workload) (realOp, error) {
 	return &scm, nil
 }
 
@@ -1265,9 +1265,12 @@ func RunBenchmarkPerfScheduling(b *testing.B, configFile string, topicName strin
 					}
 
 					if opts.prepareFn != nil {
-						err = opts.prepareFn(tCtx)
+						cleanup, err := opts.prepareFn(tCtx, w)
 						if err != nil {
 							b.Fatalf("failed to run prepareFn: %v", err)
+						}
+						if cleanup != nil {
+							b.Cleanup(cleanup)
 						}
 					}
 
@@ -1352,7 +1355,12 @@ func RunBenchmarkPerfScheduling(b *testing.B, configFile string, topicName strin
 }
 
 // RunIntegrationPerfScheduling runs the scheduler performance integration tests.
-func RunIntegrationPerfScheduling(t *testing.T, configFile string) {
+func RunIntegrationPerfScheduling(t *testing.T, configFile string, options ...SchedulerPerfOption) {
+	opts := &schedulerPerfOptions{}
+	for _, option := range options {
+		option(opts)
+	}
+
 	testCases, err := getTestCases(configFile)
 	if err != nil {
 		t.Fatal(err)
@@ -1377,7 +1385,17 @@ func RunIntegrationPerfScheduling(t *testing.T, configFile string) {
 					scheduler, informerFactory, tCtx := setupTestCase(t, tc, featureGates, nil)
 					err := w.isValid(tc.MetricsCollectorConfig)
 					if err != nil {
-						t.Fatalf("workload %s is not valid: %v", w.Name, err)
+						t.Fatalf("Workload %s is not valid: %v", w.Name, err)
+					}
+
+					if opts.prepareFn != nil {
+						cleanup, err := opts.prepareFn(tCtx, w)
+						if err != nil {
+							t.Fatalf("failed to run prepareFn: %v", err)
+						}
+						if cleanup != nil {
+							t.Cleanup(cleanup)
+						}
 					}
 
 					_, err = runWorkload(tCtx, tc, w, "" /* topic name not relevant */, scheduler, informerFactory)
@@ -1417,7 +1435,7 @@ func loadSchedulerConfig(file string) (*config.KubeSchedulerConfiguration, error
 	return nil, fmt.Errorf("couldn't decode as KubeSchedulerConfiguration, got %s: ", gvk)
 }
 
-func unrollWorkloadTemplate(tb ktesting.TB, wt []op, w *workload) []op {
+func unrollWorkloadTemplate(tb ktesting.TB, wt []op, w *Workload) []op {
 	var unrolled []op
 	for opIndex, o := range wt {
 		realOp, err := o.realOp.patchParams(w)
@@ -1576,12 +1594,12 @@ type WorkloadExecutor struct {
 	podInformer                  coreinformers.PodInformer
 	throughputErrorMargin        float64
 	testCase                     *testCase
-	workload                     *workload
+	Workload                     *Workload
 	topicName                    string
 	nextNodeIndex                int
 }
 
-func runWorkload(tCtx ktesting.TContext, tc *testCase, w *workload, topicName string, scheduler *scheduler.Scheduler, informerFactory informers.SharedInformerFactory) ([]DataItem, error) {
+func runWorkload(tCtx ktesting.TContext, tc *testCase, w *Workload, topicName string, scheduler *scheduler.Scheduler, informerFactory informers.SharedInformerFactory) ([]DataItem, error) {
 	b, benchmarking := tCtx.TB().(*testing.B)
 	if benchmarking {
 		start := time.Now()
@@ -1620,7 +1638,7 @@ func runWorkload(tCtx ktesting.TContext, tc *testCase, w *workload, topicName st
 		podInformer:                  podInformer,
 		throughputErrorMargin:        throughputErrorMargin,
 		testCase:                     tc,
-		workload:                     w,
+		Workload:                     w,
 		topicName:                    topicName,
 	}
 
@@ -1759,7 +1777,7 @@ func (e *WorkloadExecutor) runSleepOp(op *sleepOp) error {
 }
 
 func (e *WorkloadExecutor) runStopCollectingMetrics(opIndex int) error {
-	items, err := stopCollectingMetrics(e.tCtx, e.collectorCtx, &e.collectorWG, e.workload.Threshold.Get(e.topicName), *e.workload.ThresholdMetricSelector, opIndex, e.collectors)
+	items, err := stopCollectingMetrics(e.tCtx, e.collectorCtx, &e.collectorWG, e.Workload.Threshold.Get(e.topicName), *e.Workload.ThresholdMetricSelector, opIndex, e.collectors)
 	if err != nil {
 		return err
 	}
@@ -1813,7 +1831,7 @@ func (e *WorkloadExecutor) runCreatePodsOp(opIndex int, op *createPodsOp) error 
 		// CollectMetrics and SkipWaitToCompletion can never be true at the
 		// same time, so if we're here, it means that all pods have been
 		// scheduled.
-		items, err := stopCollectingMetrics(e.tCtx, e.collectorCtx, &e.collectorWG, e.workload.Threshold.Get(e.topicName), *e.workload.ThresholdMetricSelector, opIndex, e.collectors)
+		items, err := stopCollectingMetrics(e.tCtx, e.collectorCtx, &e.collectorWG, e.Workload.Threshold.Get(e.topicName), *e.Workload.ThresholdMetricSelector, opIndex, e.collectors)
 		if err != nil {
 			return err
 		}
@@ -2425,7 +2443,7 @@ func validateTestCases(testCases []*testCase) error {
 		if len(tc.Workloads) == 0 {
 			return fmt.Errorf("%s: no workloads defined", tc.Name)
 		}
-		if err := tc.workloadNamesUnique(); err != nil {
+		if err := tc.WorkloadNamesUnique(); err != nil {
 			return err
 		}
 		if len(tc.WorkloadTemplate) == 0 {

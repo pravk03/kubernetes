@@ -21,7 +21,7 @@ import "k8s.io/kubernetes/test/utils/ktesting"
 type SchedulerPerfOption func(options *schedulerPerfOptions)
 
 // PrepareFn is a function that is called before each workload is run.
-type PrepareFn func(tCtx ktesting.TContext) error
+type PrepareFn func(tCtx ktesting.TContext, w *Workload) (func(), error)
 
 type schedulerPerfOptions struct {
 	prepareFn PrepareFn
