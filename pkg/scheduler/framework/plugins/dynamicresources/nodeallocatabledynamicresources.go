@@ -39,16 +39,32 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
+// nodeAllocatableClaim is a request of a pod's claim with devices that have node allocatable resources on a node.
+type nodeAllocatableClaim struct {
+	key     v1.ObjectReference
+	request string
+	// devices are the allocated devices of the request that have node allocatable resources.
+	devices []nodeAllocatableDeviceAllocation
+}
+
+// claimRequest identifies a request of a claim.
+type claimRequest struct {
+	uid     types.UID
+	request string
+}
+
+// nodeAllocatableDeviceAllocation is a device of a claim and its allocation result.
+type nodeAllocatableDeviceAllocation struct {
+	result *resourceapi.DeviceRequestAllocationResult
+	device *resourceapi.Device
+}
+
 // calculateAndCheckNodeAllocatableResources calculates the total node-allocatable resources (e.g., CPU, memory)
 // requested by a pod, considering both its standard container requests and any additional resources
 // derived from its DRA claims. It then checks if this aggregated demand fits within the node's remaining allocatable capacity.
 func (pl *DynamicResources) calculateAndCheckNodeAllocatableResources(ctx context.Context, state *stateData, pod *v1.Pod, nodeInfo fwk.NodeInfo, allocations map[types.UID]*resourceapi.AllocationResult, extendedResourceRequestMappings []v1.ContainerExtendedResourceRequest) ([]v1.ExtraNodeAllocatableResource, *fwk.Status) {
 	logger := klog.FromContext(ctx)
-
-	nodeAllocatableClaims := []*resourceapi.ResourceClaim{}
-
-	var err error
-
+	nodeAllocatableClaims := []nodeAllocatableClaim{}
 	nodeSlices, err := filterSlicesForNode(pl.draManager, nodeInfo.Node())
 	if err != nil {
 		logger.Error(err, "Failed to list resource slices")
@@ -61,19 +77,13 @@ func (pl *DynamicResources) calculateAndCheckNodeAllocatableResources(ctx contex
 			alloc = a
 		}
 		if alloc != nil && len(alloc.Devices.Results) > 0 {
-			for _, result := range alloc.Devices.Results {
-				if result.AdminAccess != nil && *result.AdminAccess {
-					continue
-				}
-				device, err := getDeviceFromSlices(nodeSlices, &result, nodeInfo.Node())
-				if err != nil {
-					logger.Error(err, "Failed to get device from manager", "claim", klog.KObj(claim), "device", result.Device, "pool", result.Pool, "driver", result.Driver)
-					continue
-				}
-				if device != nil && len(device.NodeAllocatableResources) > 0 {
-					nodeAllocatableClaims = append(nodeAllocatableClaims, claim)
-					break
-				}
+			requests, err := nodeAllocatableDevices(logger, claim, alloc, nodeSlices, nodeInfo.Node())
+			if err != nil {
+				return nil, statusError(logger, err)
+			}
+			key := v1.ObjectReference{Namespace: claim.Namespace, Name: claim.Name, UID: claim.UID}
+			for request, devices := range requests {
+				nodeAllocatableClaims = append(nodeAllocatableClaims, nodeAllocatableClaim{key: key, request: request, devices: devices})
 			}
 		}
 	}
@@ -83,7 +93,7 @@ func (pl *DynamicResources) calculateAndCheckNodeAllocatableResources(ctx contex
 	}
 
 	otherEntries := state.extraNodeAllocatableResources.GetExcludingPlugin(nodeInfo.Node().Name, Name)
-	totalPodDemand, extraResources, status := pl.getPodNodeAllocatableResourceFootprint(logger, pod, allocations, nodeAllocatableClaims, extendedResourceRequestMappings, otherEntries, nodeSlices, nodeInfo.Node())
+	totalPodDemand, extraResources, status := pl.getPodNodeAllocatableResourceFootprint(logger, pod, nodeAllocatableClaims, extendedResourceRequestMappings, otherEntries)
 	if status != nil {
 		logger.V(5).Info("calculateAndCheckNodeAllocatableResources: getPodNodeAllocatableResourceFootprint failed", "status", status)
 		return nil, status
@@ -96,12 +106,59 @@ func (pl *DynamicResources) calculateAndCheckNodeAllocatableResources(ctx contex
 	return extraResources, nil
 }
 
-func getDeviceFromManager(draManager fwk.SharedDRAManager, result *resourceapi.DeviceRequestAllocationResult) (*resourceapi.Device, error) {
-	slices, err := draManager.ResourceSlices().ListWithDeviceTaintRules()
-	if err != nil {
-		return nil, fmt.Errorf("listing resource slices: %w", err)
+// nodeAllocatableDevices returns the devices of the allocation that have node allocatable resources, by request.
+func nodeAllocatableDevices(logger klog.Logger, claim *resourceapi.ResourceClaim, alloc *resourceapi.AllocationResult, nodeSlices []*resourceapi.ResourceSlice, node *v1.Node) (map[string][]nodeAllocatableDeviceAllocation, error) {
+	results := alloc.Devices.Results
+	var requests map[string][]nodeAllocatableDeviceAllocation
+	var lookupErr error
+	for i := range results {
+		result := &results[i]
+		if result.AdminAccess != nil && *result.AdminAccess {
+			continue
+		}
+		device, err := getDeviceFromSlices(nodeSlices, result, node)
+		if err != nil {
+			logger.Error(err, "Failed to get device from manager", "claim", klog.KObj(claim), "device", result.Device, "pool", result.Pool, "driver", result.Driver)
+			if lookupErr == nil {
+				lookupErr = fmt.Errorf("claim %s/%s, device %s, driver %s: %w", claim.Namespace, claim.Name, result.Device, result.Driver, err)
+			}
+			continue
+		}
+		if device != nil && len(device.NodeAllocatableResources) > 0 {
+			if requests == nil {
+				// Allocated only for claims that have such devices.
+				requests = make(map[string][]nodeAllocatableDeviceAllocation)
+			}
+			// Containers reference a request by its name, also when one of its subrequests was allocated.
+			request := resourceclaim.BaseRequestRef(result.Request)
+			requests[request] = append(requests[request], nodeAllocatableDeviceAllocation{result: result, device: device})
+		}
 	}
-	return getDeviceFromSlices(slices, result, nil)
+	// A device that was not found may have node allocatable resources too, so the totals would be too low.
+	if len(requests) > 0 && lookupErr != nil {
+		return nil, lookupErr
+	}
+	return requests, nil
+}
+
+// allocationHasNodeAllocatableMapping reports whether any device of the allocation maps node allocatable resources.
+func allocationHasNodeAllocatableMapping(alloc *resourceapi.AllocationResult, slices []*resourceapi.ResourceSlice) bool {
+	for i := range alloc.Devices.Results {
+		result := &alloc.Devices.Results[i]
+		if result.AdminAccess != nil && *result.AdminAccess {
+			continue
+		}
+		device, err := getDeviceFromSlices(slices, result, nil)
+		if err != nil || device == nil {
+			continue
+		}
+		for _, resource := range device.NodeAllocatableResources {
+			if resource.Mapping != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func filterSlicesForNode(draManager fwk.SharedDRAManager, node *v1.Node) ([]*resourceapi.ResourceSlice, error) {
@@ -244,35 +301,58 @@ func addDeviceOverhead(
 	totalResources[resourceName] = current
 }
 
+// mergeExtraNodeAllocatableResource adds the mapped and overhead resources of src to dst.
+func mergeExtraNodeAllocatableResource(dst *v1.ExtraNodeAllocatableResource, src v1.ExtraNodeAllocatableResource) {
+	for _, m := range src.Mapping {
+		i := slices.IndexFunc(dst.Mapping, func(e v1.NodeAllocatableMappedResources) bool { return e.Name == m.Name })
+		if i < 0 {
+			// same source not found in dst
+			dst.Mapping = append(dst.Mapping, m)
+		} else {
+			dst.Mapping[i].Quantity.Add(*m.Quantity)
+		}
+	}
+	for _, o := range src.Overhead {
+		i := slices.IndexFunc(dst.Overhead, func(e v1.NodeAllocatableOverheadResources) bool { return e.Name == o.Name })
+		if i < 0 {
+			dst.Overhead = append(dst.Overhead, o)
+		} else {
+			if o.PerPod != nil {
+				if dst.Overhead[i].PerPod == nil {
+					dst.Overhead[i].PerPod = o.PerPod
+				} else {
+					dst.Overhead[i].PerPod.Add(*o.PerPod)
+				}
+			}
+			if o.PerContainer != nil {
+				if dst.Overhead[i].PerContainer == nil {
+					dst.Overhead[i].PerContainer = o.PerContainer
+				} else {
+					dst.Overhead[i].PerContainer.Add(*o.PerContainer)
+				}
+			}
+		}
+	}
+}
+
 // buildNodeAllocatableDRAInfo processes the node allocatable resource allocations for a pod.
 // It translates the allocated devices and quantities from DRA claims into a list of v1.ExtraNodeAllocatableResource.
-func (pl *DynamicResources) buildNodeAllocatableDRAInfo(pod *v1.Pod, nodeAllocatableClaimAllocations map[v1.ObjectReference]*resourceapi.AllocationResult, claimNametoUID map[string]types.UID, extendedResourceRequestMappings []v1.ContainerExtendedResourceRequest, resourceSlices []*resourceapi.ResourceSlice, node *v1.Node) ([]v1.ExtraNodeAllocatableResource, error) {
+func (pl *DynamicResources) buildNodeAllocatableDRAInfo(pod *v1.Pod, nodeAllocatableClaimAllocations []nodeAllocatableClaim, claimNametoUID map[string]types.UID, extendedResourceRequestMappings []v1.ContainerExtendedResourceRequest) ([]v1.ExtraNodeAllocatableResource, error) {
 	if len(nodeAllocatableClaimAllocations) == 0 {
 		return []v1.ExtraNodeAllocatableResource{}, nil
 	}
-
-	claimToResource := make(map[types.UID]v1.ExtraNodeAllocatableResource)
-
-	for key, alloc := range nodeAllocatableClaimAllocations {
+	// A container can use a single request of a claim, so each request of a claim gets its own entry.
+	claimRequestToResource := make(map[claimRequest]v1.ExtraNodeAllocatableResource)
+	for _, c := range nodeAllocatableClaimAllocations {
+		key := c.key
 		totalDirectMappedResourcesPerClaim := make(map[v1.ResourceName]resource.Quantity)
 		totalOverheadResourcesPerClaim := make(map[v1.ResourceName]v1.NodeAllocatableOverheadResources)
 		extendedResourceClaimContainers := []string{}
 
-		for _, result := range alloc.Devices.Results {
-			if result.AdminAccess != nil && *result.AdminAccess {
-				continue
-			}
-			device, err := getDeviceFromSlices(resourceSlices, &result, node)
-			if err != nil {
-				return nil, fmt.Errorf("claim %s/%s, device %s, driver %s: %w", key.Namespace, key.Name, result.Device, result.Driver, err)
-			}
-			if device == nil || device.NodeAllocatableResources == nil {
-				continue
-			}
-
-			for resourceName, resourceMap := range device.NodeAllocatableResources {
+		for _, d := range c.devices {
+			for resourceName, resourceMap := range d.device.NodeAllocatableResources {
 				if resourceMap.Mapping != nil {
-					if err := addDeviceMapping(resourceName, resourceMap.Mapping, &result, key, totalDirectMappedResourcesPerClaim); err != nil {
+					if err := addDeviceMapping(resourceName, resourceMap.Mapping, d.result, key, totalDirectMappedResourcesPerClaim); err != nil {
 						return nil, err
 					}
 				}
@@ -285,7 +365,7 @@ func (pl *DynamicResources) buildNodeAllocatableDRAInfo(pod *v1.Pod, nodeAllocat
 			// container.Resources.Claims, so their requesting containers must be resolved here.
 			if isSpecialClaimName(key.Name) {
 				for _, m := range extendedResourceRequestMappings {
-					if m.RequestName == result.Request && !slices.Contains(extendedResourceClaimContainers, m.ContainerName) {
+					if m.RequestName == d.result.Request && !slices.Contains(extendedResourceClaimContainers, m.ContainerName) {
 						extendedResourceClaimContainers = append(extendedResourceClaimContainers, m.ContainerName)
 					}
 				}
@@ -293,25 +373,6 @@ func (pl *DynamicResources) buildNodeAllocatableDRAInfo(pod *v1.Pod, nodeAllocat
 		}
 
 		if len(totalDirectMappedResourcesPerClaim) > 0 || len(totalOverheadResourcesPerClaim) > 0 {
-			if isSpecialClaimName(key.Name) {
-				// Per-container overhead is charged for every container in the entry, which assumes that
-				// every container uses every device, as with a regular claim. The extended resource claim
-				// gives each container its own devices instead, so record its overhead per pod to charge
-				// each device once. For example, two containers with one GPU each and 1Gi per-container
-				// overhead per GPU need 2Gi, not 2 GPUs x 2 containers = 4Gi.
-				for name, overhead := range totalOverheadResourcesPerClaim {
-					if overhead.PerContainer == nil {
-						continue
-					}
-					if overhead.PerPod == nil {
-						overhead.PerPod = overhead.PerContainer
-					} else {
-						overhead.PerPod.Add(*overhead.PerContainer)
-					}
-					overhead.PerContainer = nil
-					totalOverheadResourcesPerClaim[name] = overhead
-				}
-			}
 			res := v1.ExtraNodeAllocatableResource{
 				Source: v1.ExtraNodeAllocatableReference{
 					APIGroup: resourceapi.GroupName,
@@ -335,13 +396,7 @@ func (pl *DynamicResources) buildNodeAllocatableDRAInfo(pod *v1.Pod, nodeAllocat
 				res.Overhead = append(res.Overhead, overhead)
 			}
 
-			sort.Slice(res.Mapping, func(i, j int) bool {
-				return res.Mapping[i].Name < res.Mapping[j].Name
-			})
-			sort.Slice(res.Overhead, func(i, j int) bool {
-				return res.Overhead[i].Name < res.Overhead[j].Name
-			})
-			claimToResource[key.UID] = res
+			claimRequestToResource[claimRequest{uid: key.UID, request: c.request}] = res
 		}
 	}
 
@@ -350,26 +405,53 @@ func (pl *DynamicResources) buildNodeAllocatableDRAInfo(pod *v1.Pod, nodeAllocat
 		for _, container := range containers {
 			for _, podClaim := range container.Resources.Claims {
 				if claimUID, ok := claimNametoUID[podClaim.Name]; ok {
-					if res, ok := claimToResource[claimUID]; ok && !slices.Contains(res.Containers, container.Name) {
-						res.Containers = append(res.Containers, container.Name)
-						claimToResource[claimUID] = res
+					for k, res := range claimRequestToResource {
+						// A container that does not name a request uses all requests of the claim.
+						if k.uid == claimUID && (podClaim.Request == "" || podClaim.Request == k.request) && !slices.Contains(res.Containers, container.Name) {
+							res.Containers = append(res.Containers, container.Name)
+							claimRequestToResource[k] = res
+						}
 					}
 				}
 			}
 		}
 	}
 
-	extraResources := make([]v1.ExtraNodeAllocatableResource, 0, len(claimToResource))
-	for _, res := range claimToResource {
+	extraResources := make([]v1.ExtraNodeAllocatableResource, 0, len(claimRequestToResource))
+	for _, res := range claimRequestToResource {
+		slices.Sort(res.Containers)
 		extraResources = append(extraResources, res)
 	}
 
 	// Sort the results for consistent output.
 	sort.Slice(extraResources, func(i, j int) bool {
-		return extraResources[i].Source.Name < extraResources[j].Source.Name
+		if extraResources[i].Source.Name != extraResources[j].Source.Name {
+			return extraResources[i].Source.Name < extraResources[j].Source.Name
+		}
+		return slices.Compare(extraResources[i].Containers, extraResources[j].Containers) < 0
 	})
 
-	return extraResources, nil
+	// The pod status allows one entry per source and set of containers. Merge adjacent entries
+	// that share the same source and containers, for example when a container references the whole claim.
+	merged := extraResources[:0]
+	for _, res := range extraResources {
+		if len(merged) > 0 && merged[len(merged)-1].Source == res.Source && slices.Equal(merged[len(merged)-1].Containers, res.Containers) {
+			mergeExtraNodeAllocatableResource(&merged[len(merged)-1], res)
+		} else {
+			merged = append(merged, res)
+		}
+	}
+
+	for _, res := range merged {
+		sort.Slice(res.Mapping, func(i, j int) bool {
+			return res.Mapping[i].Name < res.Mapping[j].Name
+		})
+		sort.Slice(res.Overhead, func(i, j int) bool {
+			return res.Overhead[i].Name < res.Overhead[j].Name
+		})
+	}
+
+	return merged, nil
 }
 
 // validateNodeAllocatableDRAClaimSharing ensures that a node-allocatable DRA claim is not already in use by another pod on this node.
@@ -495,23 +577,7 @@ func (pl *DynamicResources) validatePodLevelResourcesCoverDRA(pod *v1.Pod) *fwk.
 
 // getPodNodeAllocatableResourceFootprint determines the total nodeAllocatable resource demand of a pod.
 // otherEntries, recorded by other plugins, count towards the demand but are not returned.
-func (pl *DynamicResources) getPodNodeAllocatableResourceFootprint(logger klog.Logger, pod *v1.Pod, allocations map[types.UID]*resourceapi.AllocationResult, nodeAllocatableClaims []*resourceapi.ResourceClaim, extendedResourceRequestMappings []v1.ContainerExtendedResourceRequest, otherEntries []v1.ExtraNodeAllocatableResource, nodeSlices []*resourceapi.ResourceSlice, node *v1.Node) (*framework.Resource, []v1.ExtraNodeAllocatableResource, *fwk.Status) {
-	nodeAllocatableDRAAllocations := make(map[v1.ObjectReference]*resourceapi.AllocationResult)
-	// Add pre-allocated claims
-	for _, claim := range nodeAllocatableClaims {
-		key := v1.ObjectReference{
-			Namespace: claim.Namespace,
-			Name:      claim.Name,
-			UID:       claim.UID,
-		}
-		if claim.Status.Allocation != nil {
-			nodeAllocatableDRAAllocations[key] = claim.Status.Allocation
-		}
-		if alloc, ok := allocations[claim.UID]; ok {
-			nodeAllocatableDRAAllocations[key] = alloc
-		}
-	}
-
+func (pl *DynamicResources) getPodNodeAllocatableResourceFootprint(logger klog.Logger, pod *v1.Pod, nodeAllocatableClaims []nodeAllocatableClaim, extendedResourceRequestMappings []v1.ContainerExtendedResourceRequest, otherEntries []v1.ExtraNodeAllocatableResource) (*framework.Resource, []v1.ExtraNodeAllocatableResource, *fwk.Status) {
 	claimNametoUID := make(map[string]types.UID)
 	if err := pl.foreachPodResourceClaim(pod, func(name string, claim *resourceapi.ResourceClaim) {
 		claimNametoUID[name] = claim.UID
@@ -519,7 +585,7 @@ func (pl *DynamicResources) getPodNodeAllocatableResourceFootprint(logger klog.L
 		return nil, nil, statusError(logger, fmt.Errorf("processing pod resource claims: %w", err))
 	}
 
-	extraResources, err := pl.buildNodeAllocatableDRAInfo(pod, nodeAllocatableDRAAllocations, claimNametoUID, extendedResourceRequestMappings, nodeSlices, node)
+	extraResources, err := pl.buildNodeAllocatableDRAInfo(pod, nodeAllocatableClaims, claimNametoUID, extendedResourceRequestMappings)
 	if err != nil {
 		return nil, nil, statusError(logger, err)
 	}

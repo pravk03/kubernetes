@@ -531,28 +531,10 @@ func TestValidateNodeAllocatableDRAClaimSharing(t *testing.T) {
 			state := &stateData{
 				claimHasNodeAllocatableMappedDevice: make(map[types.UID]bool),
 			}
-			if tt.claim != nil {
-				if tt.claim.Status.Allocation != nil {
-					isMapped := false
-					for _, result := range tt.claim.Status.Allocation.Devices.Results {
-						if result.AdminAccess != nil && *result.AdminAccess {
-							continue
-						}
-						device, err := getDeviceFromManager(tt.draManager, &result)
-						if err == nil && device != nil && device.NodeAllocatableResources != nil {
-							for _, mapping := range device.NodeAllocatableResources {
-								if mapping.Mapping != nil {
-									isMapped = true
-									break
-								}
-							}
-						}
-						if isMapped {
-							break
-						}
-					}
-					state.claimHasNodeAllocatableMappedDevice[tt.claim.UID] = isMapped
-				}
+			// Same as PreFilter.
+			if tt.claim != nil && tt.claim.Status.Allocation != nil {
+				slices, _ := tt.draManager.ResourceSlices().ListWithDeviceTaintRules()
+				state.claimHasNodeAllocatableMappedDevice[tt.claim.UID] = allocationHasNodeAllocatableMapping(tt.claim.Status.Allocation, slices)
 			}
 			gotStatus := pl.validateNodeAllocatableDRAClaimSharing(tt.pod, tt.claim, state, tt.podGroupState)
 			if diff := cmp.Diff(tt.wantStatus, gotStatus); diff != "" {
@@ -1331,14 +1313,33 @@ func TestBuildNodeAllocatableDRAInfo(t *testing.T) {
 			}},
 		},
 		{
-			name:           "Invalid -  Device Not Found",
+			// The missing device may have node allocatable resources too.
+			name:           "Invalid - Device Not Found in a claim with node allocatable devices",
+			pod:            st.MakePod().Name("test-pod").Namespace(claimNameSpace).UID("test-uid").Containers([]v1.Container{{Name: "c1", Resources: v1.ResourceRequirements{Claims: []v1.ResourceClaim{{Name: "claim1"}}}}}).Obj(),
+			claims:         []*resourceapi.ResourceClaim{makeClaim("claim1", "claim1-uid")},
+			resourceSlices: []*resourceapi.ResourceSlice{makeSlice("slice1", combinedDevice)},
+			nodeAllocatableClaimAllocations: map[v1.ObjectReference]*resourceapi.AllocationResult{
+				{Name: "claim1", UID: "claim1-uid"}: {
+					Devices: resourceapi.DeviceAllocationResult{
+						Results: []resourceapi.DeviceRequestAllocationResult{
+							{Driver: "dra.example.com", Pool: "pool1", Device: "combined-device"},
+							{Driver: "dra.example.com", Pool: "pool1", Device: "nonexistent-device"},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			// Without a device that has node allocatable resources, the claim does not matter here.
+			name:           "Device Not Found in a claim without node allocatable devices",
 			pod:            st.MakePod().Name("test-pod").Namespace(claimNameSpace).UID("test-uid").Containers([]v1.Container{{Name: "c1", Resources: v1.ResourceRequirements{Claims: []v1.ResourceClaim{{Name: "claim1"}}}}}).Obj(),
 			claims:         []*resourceapi.ResourceClaim{makeClaim("claim1", "claim1-uid")},
 			resourceSlices: []*resourceapi.ResourceSlice{makeSlice("slice1", resourceapi.Device{Name: "device1"})},
 			nodeAllocatableClaimAllocations: map[v1.ObjectReference]*resourceapi.AllocationResult{
 				{Name: "claim1", UID: "claim1-uid"}: allocResult("pool1", "nonexistent-device"),
 			},
-			wantErr: true,
+			want: []v1.ExtraNodeAllocatableResource{},
 		},
 		{
 			name: "Extended resource claim - DRA GPU with CPU and memory overhead",
@@ -1390,12 +1391,13 @@ func TestBuildNodeAllocatableDRAInfo(t *testing.T) {
 				Containers: []string{"c1"},
 				Overhead: []v1.NodeAllocatableOverheadResources{
 					{
-						Name:   v1.ResourceCPU,
-						PerPod: new(resource.MustParse("500m")),
+						Name:         v1.ResourceCPU,
+						PerContainer: new(resource.MustParse("500m")),
 					},
 					{
-						Name:   v1.ResourceMemory,
-						PerPod: new(resource.MustParse("1524Mi")),
+						Name:         v1.ResourceMemory,
+						PerPod:       new(resource.MustParse("1Gi")),
+						PerContainer: new(resource.MustParse("500Mi")),
 					},
 				},
 			}},
@@ -1427,8 +1429,8 @@ func TestBuildNodeAllocatableDRAInfo(t *testing.T) {
 			want: []v1.ExtraNodeAllocatableResource{},
 		},
 		{
-			// The init container reuses gpu0 before c1 starts, so each GPU's per-container overhead is needed once:
-			// 2Gi, not 2Gi for each of the three containers.
+			// c1 and c2 each get their own GPU, and the init container reuses c1's GPU before c1 starts.
+			// Each container gets an entry only for the GPUs it uses.
 			name: "Extended resource claim - per-container overhead with devices of different containers",
 			pod: func() *v1.Pod {
 				pod := st.MakePod().Name("test-pod").Namespace(claimNameSpace).UID("test-uid").
@@ -1460,12 +1462,209 @@ func TestBuildNodeAllocatableDRAInfo(t *testing.T) {
 				{ContainerName: "c2", ResourceName: "example.com/gpu", RequestName: "container-2-request-0"},
 				{ContainerName: "init", ResourceName: "example.com/gpu", RequestName: "container-1-request-0"},
 			},
+			want: []v1.ExtraNodeAllocatableResource{
+				{
+					Source:     v1.ExtraNodeAllocatableReference{APIGroup: "resource.k8s.io", Kind: "ResourceClaim", Name: specialClaimInMemName},
+					Containers: []string{"c1", "init"},
+					Overhead: []v1.NodeAllocatableOverheadResources{{
+						Name:         v1.ResourceMemory,
+						PerContainer: new(resource.MustParse("1Gi")),
+					}},
+				},
+				{
+					Source:     v1.ExtraNodeAllocatableReference{APIGroup: "resource.k8s.io", Kind: "ResourceClaim", Name: specialClaimInMemName},
+					Containers: []string{"c2"},
+					Overhead: []v1.NodeAllocatableOverheadResources{{
+						Name:         v1.ResourceMemory,
+						PerContainer: new(resource.MustParse("1Gi")),
+					}},
+				},
+			},
+		},
+		{
+			// c1 uses an FPGA and a GPU. init1 reuses c1's GPU and needs one more GPU. init2 reuses c1's GPU.
+			// Each request becomes its own entry because a different set of containers uses it.
+			name: "Extended resource claim - multiple resources and init containers sharing requests",
+			pod: func() *v1.Pod {
+				pod := st.MakePod().Name("test-pod").Namespace(claimNameSpace).UID("test-uid").
+					Containers([]v1.Container{
+						{Name: "c1", Resources: v1.ResourceRequirements{Requests: v1.ResourceList{"example.com/fpga": resource.MustParse("1"), "example.com/gpu": resource.MustParse("1")}}},
+					}).
+					Obj()
+				pod.Spec.InitContainers = []v1.Container{
+					{Name: "init1", Resources: v1.ResourceRequirements{Requests: v1.ResourceList{"example.com/gpu": resource.MustParse("2")}}},
+					{Name: "init2", Resources: v1.ResourceRequirements{Requests: v1.ResourceList{"example.com/gpu": resource.MustParse("1")}}},
+				}
+				return pod
+			}(),
+			resourceSlices: []*resourceapi.ResourceSlice{
+				makeSlice("slice1", gpuDevicePerContainerMemory("fpga0"), gpuDevicePerContainerMemory("gpu0"), gpuDevicePerContainerMemory("gpu1")),
+			},
+			nodeAllocatableClaimAllocations: map[v1.ObjectReference]*resourceapi.AllocationResult{
+				{Name: specialClaimInMemName, UID: "ext-claim-uid"}: {
+					Devices: resourceapi.DeviceAllocationResult{
+						Results: []resourceapi.DeviceRequestAllocationResult{
+							{Request: "container-0-request-0", Driver: "dra.example.com", Pool: "pool1", Device: "gpu1"},
+							{Request: "container-2-request-0", Driver: "dra.example.com", Pool: "pool1", Device: "fpga0"},
+							{Request: "container-2-request-1", Driver: "dra.example.com", Pool: "pool1", Device: "gpu0"},
+						},
+					},
+				},
+			},
+			extendedResourceRequestMappings: []v1.ContainerExtendedResourceRequest{
+				{ContainerName: "c1", ResourceName: "example.com/fpga", RequestName: "container-2-request-0"},
+				{ContainerName: "c1", ResourceName: "example.com/gpu", RequestName: "container-2-request-1"},
+				{ContainerName: "init1", ResourceName: "example.com/gpu", RequestName: "container-2-request-1"},
+				{ContainerName: "init1", ResourceName: "example.com/gpu", RequestName: "container-0-request-0"},
+				{ContainerName: "init2", ResourceName: "example.com/gpu", RequestName: "container-2-request-1"},
+			},
+			want: []v1.ExtraNodeAllocatableResource{
+				{
+					Source:     v1.ExtraNodeAllocatableReference{APIGroup: "resource.k8s.io", Kind: "ResourceClaim", Name: specialClaimInMemName},
+					Containers: []string{"c1"},
+					Overhead: []v1.NodeAllocatableOverheadResources{{
+						Name:         v1.ResourceMemory,
+						PerContainer: new(resource.MustParse("1Gi")),
+					}},
+				},
+				{
+					Source:     v1.ExtraNodeAllocatableReference{APIGroup: "resource.k8s.io", Kind: "ResourceClaim", Name: specialClaimInMemName},
+					Containers: []string{"c1", "init1", "init2"},
+					Overhead: []v1.NodeAllocatableOverheadResources{{
+						Name:         v1.ResourceMemory,
+						PerContainer: new(resource.MustParse("1Gi")),
+					}},
+				},
+				{
+					Source:     v1.ExtraNodeAllocatableReference{APIGroup: "resource.k8s.io", Kind: "ResourceClaim", Name: specialClaimInMemName},
+					Containers: []string{"init1"},
+					Overhead: []v1.NodeAllocatableOverheadResources{{
+						Name:         v1.ResourceMemory,
+						PerContainer: new(resource.MustParse("1Gi")),
+					}},
+				},
+			},
+		},
+		{
+			// Each container gets only the device of the request it references.
+			name: "Containers using different requests of a claim",
+			pod: st.MakePod().Name("test-pod").Namespace(claimNameSpace).UID("test-uid").
+				Containers([]v1.Container{
+					{Name: "c1", Resources: v1.ResourceRequirements{Claims: []v1.ResourceClaim{{Name: "claim1", Request: "req-1"}}}},
+					{Name: "c2", Resources: v1.ResourceRequirements{Claims: []v1.ResourceClaim{{Name: "claim1", Request: "req-2"}}}},
+				}).
+				Obj(),
+			claims: []*resourceapi.ResourceClaim{makeClaim("claim1", "claim1-uid")},
+			resourceSlices: []*resourceapi.ResourceSlice{
+				makeSlice("slice1", gpuDevicePerContainerMemory("gpu0"), gpuDevicePerContainerMemory("gpu1")),
+			},
+			nodeAllocatableClaimAllocations: map[v1.ObjectReference]*resourceapi.AllocationResult{
+				{Name: "claim1", UID: "claim1-uid"}: {
+					Devices: resourceapi.DeviceAllocationResult{
+						Results: []resourceapi.DeviceRequestAllocationResult{
+							{Request: "req-1", Driver: "dra.example.com", Pool: "pool1", Device: "gpu0"},
+							{Request: "req-2", Driver: "dra.example.com", Pool: "pool1", Device: "gpu1"},
+						},
+					},
+				},
+			},
+			want: []v1.ExtraNodeAllocatableResource{
+				{
+					Source:     v1.ExtraNodeAllocatableReference{APIGroup: "resource.k8s.io", Kind: "ResourceClaim", Name: "claim1"},
+					Containers: []string{"c1"},
+					Overhead: []v1.NodeAllocatableOverheadResources{{
+						Name:         v1.ResourceMemory,
+						PerContainer: new(resource.MustParse("1Gi")),
+					}},
+				},
+				{
+					Source:     v1.ExtraNodeAllocatableReference{APIGroup: "resource.k8s.io", Kind: "ResourceClaim", Name: "claim1"},
+					Containers: []string{"c2"},
+					Overhead: []v1.NodeAllocatableOverheadResources{{
+						Name:         v1.ResourceMemory,
+						PerContainer: new(resource.MustParse("1Gi")),
+					}},
+				},
+			},
+		},
+		{
+			// c1 references the whole claim and gets both devices. c2 references req-2, which matches
+			// the device allocated for its subrequest.
+			name: "Container using the whole claim and container using a request with an allocated subrequest",
+			pod: st.MakePod().Name("test-pod").Namespace(claimNameSpace).UID("test-uid").
+				Containers([]v1.Container{
+					{Name: "c1", Resources: v1.ResourceRequirements{Claims: []v1.ResourceClaim{{Name: "claim1"}}}},
+					{Name: "c2", Resources: v1.ResourceRequirements{Claims: []v1.ResourceClaim{{Name: "claim1", Request: "req-2"}}}},
+				}).
+				Obj(),
+			claims: []*resourceapi.ResourceClaim{makeClaim("claim1", "claim1-uid")},
+			resourceSlices: []*resourceapi.ResourceSlice{
+				makeSlice("slice1", gpuDevicePerContainerMemory("gpu0"), gpuDevicePerContainerMemory("gpu1")),
+			},
+			nodeAllocatableClaimAllocations: map[v1.ObjectReference]*resourceapi.AllocationResult{
+				{Name: "claim1", UID: "claim1-uid"}: {
+					Devices: resourceapi.DeviceAllocationResult{
+						Results: []resourceapi.DeviceRequestAllocationResult{
+							{Request: "req-1", Driver: "dra.example.com", Pool: "pool1", Device: "gpu0"},
+							{Request: "req-2/large", Driver: "dra.example.com", Pool: "pool1", Device: "gpu1"},
+						},
+					},
+				},
+			},
+			want: []v1.ExtraNodeAllocatableResource{
+				{
+					Source:     v1.ExtraNodeAllocatableReference{APIGroup: "resource.k8s.io", Kind: "ResourceClaim", Name: "claim1"},
+					Containers: []string{"c1"},
+					Overhead: []v1.NodeAllocatableOverheadResources{{
+						Name:         v1.ResourceMemory,
+						PerContainer: new(resource.MustParse("1Gi")),
+					}},
+				},
+				{
+					Source:     v1.ExtraNodeAllocatableReference{APIGroup: "resource.k8s.io", Kind: "ResourceClaim", Name: "claim1"},
+					Containers: []string{"c1", "c2"},
+					Overhead: []v1.NodeAllocatableOverheadResources{{
+						Name:         v1.ResourceMemory,
+						PerContainer: new(resource.MustParse("1Gi")),
+					}},
+				},
+			},
+		},
+		{
+			// c1 references the whole claim, so both requests are used by the same container and
+			// their entries are merged into one.
+			name: "Container using the whole claim with several requests",
+			pod: st.MakePod().Name("test-pod").Namespace(claimNameSpace).UID("test-uid").
+				Containers([]v1.Container{
+					{Name: "c1", Resources: v1.ResourceRequirements{Claims: []v1.ResourceClaim{{Name: "claim1"}}}},
+				}).
+				Obj(),
+			claims: []*resourceapi.ResourceClaim{makeClaim("claim1", "claim1-uid")},
+			resourceSlices: []*resourceapi.ResourceSlice{
+				makeSlice("slice1", cpuDevicePerInstance, gpuDeviceAux, gpuDevicePerContainerMemory("gpu1"), gpuDevicePerContainerMemory("gpu2")),
+			},
+			nodeAllocatableClaimAllocations: map[v1.ObjectReference]*resourceapi.AllocationResult{
+				{Name: "claim1", UID: "claim1-uid"}: {
+					Devices: resourceapi.DeviceAllocationResult{
+						Results: []resourceapi.DeviceRequestAllocationResult{
+							{Request: "req-1", Driver: "dra.example.com", Pool: "pool1", Device: "cpu0"},
+							{Request: "req-1", Driver: "dra.example.com", Pool: "pool1", Device: "gpu1"},
+							{Request: "req-2", Driver: "dra.example.com", Pool: "pool1", Device: "gpu0"},
+							{Request: "req-2", Driver: "dra.example.com", Pool: "pool1", Device: "gpu2"},
+						},
+					},
+				},
+			},
 			want: []v1.ExtraNodeAllocatableResource{{
-				Source:     v1.ExtraNodeAllocatableReference{APIGroup: "resource.k8s.io", Kind: "ResourceClaim", Name: specialClaimInMemName},
-				Containers: []string{"c1", "init", "c2"},
+				Source:     v1.ExtraNodeAllocatableReference{APIGroup: "resource.k8s.io", Kind: "ResourceClaim", Name: "claim1"},
+				Containers: []string{"c1"},
+				Mapping: []v1.NodeAllocatableMappedResources{
+					{Name: v1.ResourceCPU, Quantity: new(resource.MustParse("3"))},
+					{Name: v1.ResourceMemory, Quantity: new(resource.MustParse("4Gi"))},
+				},
 				Overhead: []v1.NodeAllocatableOverheadResources{{
-					Name:   v1.ResourceMemory,
-					PerPod: new(resource.MustParse("2Gi")),
+					Name:         v1.ResourceMemory,
+					PerContainer: new(resource.MustParse("2Gi")),
 				}},
 			}},
 		},
@@ -1487,7 +1686,23 @@ func TestBuildNodeAllocatableDRAInfo(t *testing.T) {
 			}
 
 			slices, _ := draManager.ResourceSlices().ListWithDeviceTaintRules()
-			got, err := pl.buildNodeAllocatableDRAInfo(tt.pod, tt.nodeAllocatableClaimAllocations, claimNametoUID, tt.extendedResourceRequestMappings, slices, nil)
+			// Collect the claims like calculateAndCheckNodeAllocatableResources does.
+			nodeAllocatableClaims := []nodeAllocatableClaim{}
+			var err error
+			for key, alloc := range tt.nodeAllocatableClaimAllocations {
+				claim := &resourceapi.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name, UID: key.UID}}
+				var requests map[string][]nodeAllocatableDeviceAllocation
+				if requests, err = nodeAllocatableDevices(klog.Background(), claim, alloc, slices, nil); err != nil {
+					break
+				}
+				for request, devices := range requests {
+					nodeAllocatableClaims = append(nodeAllocatableClaims, nodeAllocatableClaim{key: key, request: request, devices: devices})
+				}
+			}
+			var got []v1.ExtraNodeAllocatableResource
+			if err == nil {
+				got, err = pl.buildNodeAllocatableDRAInfo(tt.pod, nodeAllocatableClaims, claimNametoUID, tt.extendedResourceRequestMappings)
+			}
 			if (err != nil) != tt.wantErr {
 				t.Errorf("buildNodeAllocatableDRAInfo() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -2315,6 +2530,55 @@ func TestValidatePodLevelResourcesCoverDRA(t *testing.T) {
 					},
 				}).
 				Obj(),
+			wantStatusCode: fwk.Success,
+		},
+		{
+			// c1 and c2 each use their own device of the same claim. Each container's limit plus its own 1Gi
+			// fits the pod-level limit. A single entry listing both containers would charge each of them 2Gi.
+			name: "PodLevel limits cover container limits with entries of one source for different containers",
+			pod: st.MakePod().Name("test-pod").
+				Resources(v1.ResourceRequirements{
+					Limits: v1.ResourceList{
+						v1.ResourceMemory: resource.MustParse("4Gi"),
+					},
+				}).
+				Containers([]v1.Container{
+					{
+						Name: "c1",
+						Resources: v1.ResourceRequirements{
+							Limits: v1.ResourceList{
+								v1.ResourceMemory: resource.MustParse("3Gi"),
+							},
+						},
+					},
+					{
+						Name: "c2",
+						Resources: v1.ResourceRequirements{
+							Limits: v1.ResourceList{
+								v1.ResourceMemory: resource.MustParse("3Gi"),
+							},
+						},
+					},
+				}).
+				Obj(),
+			extraResources: []v1.ExtraNodeAllocatableResource{
+				{
+					Source:     v1.ExtraNodeAllocatableReference{APIGroup: "resource.k8s.io", Kind: "ResourceClaim", Name: "dra-claim"},
+					Containers: []string{"c1"},
+					Overhead: []v1.NodeAllocatableOverheadResources{{
+						Name:   v1.ResourceMemory,
+						PerPod: new(resource.MustParse("1Gi")),
+					}},
+				},
+				{
+					Source:     v1.ExtraNodeAllocatableReference{APIGroup: "resource.k8s.io", Kind: "ResourceClaim", Name: "dra-claim"},
+					Containers: []string{"c2"},
+					Overhead: []v1.NodeAllocatableOverheadResources{{
+						Name:   v1.ResourceMemory,
+						PerPod: new(resource.MustParse("1Gi")),
+					}},
+				},
+			},
 			wantStatusCode: fwk.Success,
 		},
 	}

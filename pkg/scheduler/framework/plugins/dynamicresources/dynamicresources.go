@@ -722,6 +722,7 @@ func (pl *DynamicResources) PreFilter(ctx context.Context, state fwk.CycleState,
 	// whether a pod is sharing a direct mapped claim from another pod.
 	if pl.fts.EnableDRANodeAllocatableResources {
 		s.claimHasNodeAllocatableMappedDevice = make(map[types.UID]bool)
+		var resourceSlices []*resourceapi.ResourceSlice
 		for index, claim := range claims.all() {
 			allocation := claim.Status.Allocation
 			if allocation == nil {
@@ -731,25 +732,14 @@ func (pl *DynamicResources) PreFilter(ctx context.Context, state fwk.CycleState,
 				allocation = s.informationsForClaim[index].allocation
 			}
 			if allocation != nil {
-				isMapped := false
-				for _, result := range allocation.Devices.Results {
-					if result.AdminAccess != nil && *result.AdminAccess {
-						continue
-					}
-					device, err := getDeviceFromManager(pl.draManager, &result)
-					if err == nil && device != nil && device.NodeAllocatableResources != nil {
-						for _, mapping := range device.NodeAllocatableResources {
-							if mapping.Mapping != nil {
-								isMapped = true
-								break
-							}
-						}
-					}
-					if isMapped {
-						break
+				// List the Slices once and use it for all allocations
+				if resourceSlices == nil {
+					var err error
+					if resourceSlices, err = pl.draManager.ResourceSlices().ListWithDeviceTaintRules(); err != nil {
+						logger.Error(err, "Failed to list resource slices")
 					}
 				}
-				s.claimHasNodeAllocatableMappedDevice[claim.UID] = isMapped
+				s.claimHasNodeAllocatableMappedDevice[claim.UID] = allocationHasNodeAllocatableMapping(allocation, resourceSlices)
 			}
 		}
 	}
